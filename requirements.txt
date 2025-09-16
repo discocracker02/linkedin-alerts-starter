@@ -1,0 +1,7 @@
+playwright==1.47.0
+python-dotenv==1.0.1
+requests==2.32.3
+beautifulsoup4==4.12.3
+pytz==2024.1
+slack_sdk==3.31.0
+aiosmtplib==3.0.1

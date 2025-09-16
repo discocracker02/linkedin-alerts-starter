@@ -1,0 +1,4 @@
+# IST schedule — paste into `crontab -e` (adjust path to your folder)
+0 10-23 * * * cd ~/linkedin-alerts && ~/linkedin-alerts/venv/bin/python linkedin_alerts.py >> run.log 2>&1
+0 0 * * * cd ~/linkedin-alerts && ~/linkedin-alerts/venv/bin/python linkedin_alerts.py >> run.log 2>&1
+0 10 * * * cd ~/linkedin-alerts && ~/linkedin-alerts/venv/bin/python linkedin_alerts.py >> run.log 2>&1
