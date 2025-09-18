@@ -5,3 +5,4 @@ beautifulsoup4==4.12.3
 pytz==2024.1
 slack_sdk==3.31.0
 aiosmtplib==3.0.1
+aiohttp==3.9.5
