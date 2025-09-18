@@ -1,4 +1,4 @@
-name: LinkedIn Alerts (IST hourly)
+name: LinkedIn Alerts
 
 on:
   schedule:
