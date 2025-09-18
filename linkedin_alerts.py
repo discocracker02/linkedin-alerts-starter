@@ -25,8 +25,8 @@ SMTP_USER  = os.getenv("SMTP_USER")
 SMTP_PASS  = os.getenv("SMTP_PASS")
 
 # Quiet hours (IST): suppress immediate notifications; queued items flush at ~10:00
-QUIET_START = 1      # 01:00 inclusive
-QUIET_END   = 10     # 10:00 exclusive
+QUIET_START = 0      # 01:00 inclusive
+QUIET_END   = 0     # 10:00 exclusive
 
 # Rate limiting / stealth knobs (conservative)
 PAGE_LOAD_SETTLE_RANGE = (1.0, 1.6)      # seconds after navigation
