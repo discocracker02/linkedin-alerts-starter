@@ -1,41 +1,41 @@
-import asyncio, json, os, re, sqlite3, pytz, aiosmtplib, time, random
+# linkedin_alerts.py
+import asyncio, json, os, re, sqlite3, pytz, time, random
 from datetime import datetime, timedelta
-from email.mime.text import MIMEText
 from pathlib import Path
 from typing import List, Dict, Any
+
 from dotenv import load_dotenv
 from bs4 import BeautifulSoup
-from slack_sdk.webhook.async_client import AsyncWebhookClient
 from playwright.async_api import async_playwright, Error as PWError
+from slack_sdk.webhook.async_client import AsyncWebhookClient
 
 # ================================
 # Config / Env
 # ================================
 load_dotenv()
+
 TZ = pytz.timezone(os.getenv("TZ", "Asia/Kolkata"))
 DB_PATH = "jobs.db"
 SEARCHES_PATH = "searches.json"
 
 SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL")
-EMAIL_FROM = os.getenv("EMAIL_FROM")
-EMAIL_TO   = os.getenv("EMAIL_TO")
-SMTP_HOST  = os.getenv("SMTP_HOST")
-SMTP_PORT  = int(os.getenv("SMTP_PORT", "587") or "587")
-SMTP_USER  = os.getenv("SMTP_USER")
-SMTP_PASS  = os.getenv("SMTP_PASS")
 
-# Quiet hours (IST): suppress immediate notifications; queued items flush at ~10:00
-QUIET_START = 0      # 01:00 inclusive
-QUIET_END   = 0     # 10:00 exclusive
+# Quiet hours DISABLED (send 24×7 as requested)
+QUIET_START = 0
+QUIET_END = 0
 
-# Rate limiting / stealth knobs (conservative)
-PAGE_LOAD_SETTLE_RANGE = (1.0, 1.6)      # seconds after navigation
-SCROLL_STEPS_MAX       = 4               # how many lazy-load scrolls at most
-SCROLL_SLEEP_RANGE     = (0.6, 1.0)      # sleep between scrolls
-INTER_SEARCH_SLEEP     = (8.0, 14.0)     # pause between searches
-GLOBAL_TIMEOUT_MS      = 35000           # default wait timeout per step
+# Headless & context mode (env-controlled)
+HEADLESS = os.getenv("HEADLESS", "true").lower() == "true"
+PW_CONTEXT_MODE = os.getenv("PW_CONTEXT", "persistent").lower()   # "persistent" (local) or "storage" (CI)
+IS_CI = os.getenv("CI", "").lower() == "true"
+
+# Stealth / pacing
+PAGE_LOAD_SETTLE_RANGE = (0.8, 1.2)       # seconds after navigation
+SCROLL_STEPS_MAX       = 4                # soft scrolls to trigger lazy-load
+SCROLL_SLEEP_RANGE     = (0.5, 0.9)
+INTER_SEARCH_SLEEP     = (3.0, 6.0) if IS_CI else (8.0, 14.0)
+GLOBAL_TIMEOUT_MS      = 30000 if IS_CI else 35000
 FAIL_FAST_ON_CHALLENGE = True
-HEADLESS = os.getenv("HEADLESS", "false").lower() == "true"
 
 Path(DB_PATH).touch(exist_ok=True)
 
@@ -58,14 +58,14 @@ def init_db():
               label TEXT,
               posted_at TEXT,
               first_seen_at TEXT,
-              notified INTEGER DEFAULT 0,
-              queued INTEGER DEFAULT 0
+              notified INTEGER DEFAULT 0
             )
         """)
         conn.commit()
 
 def is_quiet_hour(dt: datetime) -> bool:
-    return QUIET_START <= dt.hour < QUIET_END
+    # disabled
+    return QUIET_START <= dt.hour < QUIET_END if (QUIET_START or QUIET_END) else False
 
 def linkedin_relative_to_dt(txt: str, ref_dt: datetime) -> datetime:
     txt = (txt or "").strip().lower()
@@ -83,35 +83,59 @@ def linkedin_relative_to_dt(txt: str, ref_dt: datetime) -> datetime:
     }.get(unit, timedelta(0))
     return ref_dt - delta
 
-async def click_if_exists(page, selector, timeout=2500):
+def _collapse_ws(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "").strip())
+
+def clean_title_company_location(title: str, company: str, location: str) -> tuple:
+    # Strip badges like "with verification"/"verified"
+    def strip_badges(x: str) -> str:
+        x = re.sub(r"\bwith verification\b", "", (x or ""), flags=re.IGNORECASE)
+        x = re.sub(r"\bverified\b", "", x, flags=re.IGNORECASE)
+        return _collapse_ws(x)
+
+    title = strip_badges(title)
+    company = strip_badges(company)
+    location = _collapse_ws(location)
+
+    # Collapse duplicated titles (e.g., "AAA AAA" or "AAAAAA" halves equal)
+    xs = _collapse_ws(title)
+    if len(xs) >= 6 and len(xs) % 2 == 0:
+        h = len(xs) // 2
+        if xs[:h].lower() == xs[h:].lower():
+            title = xs[:h]
+        else:
+            m = re.match(r"^(.+?)\1$", xs, flags=re.IGNORECASE)
+            title = m.group(1) if m else xs
+    else:
+        m = re.match(r"^(.+?)\1$", xs, flags=re.IGNORECASE)
+        title = m.group(1) if m else xs
+
+    return title, _collapse_ws(company), _collapse_ws(location)
+
+async def click_if_exists(page, selector, timeout=2000):
     try:
         el = await page.wait_for_selector(selector, timeout=timeout, state="visible")
         if el:
             await el.click()
-            await page.wait_for_timeout(500)
+            await page.wait_for_timeout(400)
             return True
     except PWError:
         pass
     return False
 
 async def is_challenge(page) -> bool:
-    """Return True only for *real* checkpoints/captchas."""
+    """Return True only for real checkpoint/captcha states."""
     try:
-        url = page.url.lower()
+        url = (page.url or "").lower()
         if "checkpoint" in url:
             return True
-        # Only treat captcha as real if the widget/input is actually visible
         cap_iframe = await page.query_selector("iframe[src*='recaptcha'], iframe[title*='captcha']")
-        cap_input = await page.query_selector("input[name='captcha']")
-        target = cap_iframe or cap_input
-        if target:
-            try:
-                box = await target.bounding_box()
-                if box and box.get("width", 0) > 0 and box.get("height", 0) > 0:
-                    return True
-            except Exception:
-                pass
-        # Severe verification banners
+        cap_input  = await page.query_selector("input[name='captcha']")
+        tgt = cap_iframe or cap_input
+        if tgt:
+            box = await tgt.bounding_box()
+            if box and box.get("width", 0) > 0 and box.get("height", 0) > 0:
+                return True
         if await page.query_selector("div[role='alert']:has-text('verify'), h1:has-text('Verification')"):
             return True
     except PWError:
@@ -119,16 +143,14 @@ async def is_challenge(page) -> bool:
     return False
 
 async def settle_and_find(page) -> bool:
-    # Consent banners (best effort)
+    # cookie/consent
     for text in ["Accept", "I agree", "Allow all", "Allow"]:
         if await click_if_exists(page, f"button:has-text('{text}')", 1500):
             break
 
-    # Sometimes there’s a “See all jobs” CTA
     await click_if_exists(page, "a:has-text('See all jobs')", 2000)
     await click_if_exists(page, "button:has-text('See all jobs')", 2000)
 
-    # Candidate containers (LinkedIn has multiple variants)
     containers = [
         "ul.jobs-search__results-list",
         ".jobs-search-results-list",
@@ -137,49 +159,43 @@ async def settle_and_find(page) -> bool:
         "div.base-serp-page__content",
         "main[role='main']"
     ]
-
-    # First pass: wait for any plausible result
     for sel in containers:
         try:
             await page.wait_for_selector(
                 f"{sel} li, {sel} .job-card-container, {sel} a[href*='/jobs/view/']",
-                timeout=12000,
+                timeout=10000,
                 state="attached"
             )
             return True
         except PWError:
             continue
 
-    # Lazy-load by scrolling (limited)
+    # Lazy load
     for _ in range(SCROLL_STEPS_MAX):
         await page.mouse.wheel(0, 1200)
         await page.wait_for_timeout(int(random.uniform(*SCROLL_SLEEP_RANGE) * 1000))
         for sel in containers:
-            try:
-                el = await page.query_selector(f"{sel} li, {sel} .job-card-container, {sel} a[href*='/jobs/view/']")
-                if el:
-                    return True
-            except PWError:
-                continue
+            el = await page.query_selector(f"{sel} li, {sel} .job-card-container, {sel} a[href*='/jobs/view/']")
+            if el:
+                return True
 
-    # Ultra-fallback: any job link anywhere
-    try:
-        if await page.query_selector("a[href*='/jobs/view/']"):
-            return True
-    except PWError:
-        pass
+    # Final fallback
+    if await page.query_selector("a[href*='/jobs/view/']"):
+        return True
 
-    # Debug snapshot
+    # Debug
     try:
         snap = f"debug_{int(time.time())}.png"
         await page.screenshot(path=snap, full_page=True)
         print(f"[debug] Saved screenshot: {snap}")
-    except:
+    except Exception:
         pass
     return False
 
 def parse_jobs_from_html(html: str, label: str, ref_dt: datetime) -> List[Dict[str, Any]]:
     soup = BeautifulSoup(html, "html.parser")
+    seen_ids = set()
+
     items = soup.select("""
         ul.jobs-search__results-list li,
         .jobs-search-results-list li,
@@ -188,7 +204,7 @@ def parse_jobs_from_html(html: str, label: str, ref_dt: datetime) -> List[Dict[s
         div.job-card-container
     """)
     if not items:
-        items = soup.select("a[href*='/jobs/view/']")  # ultra-fallback
+        items = soup.select("a[href*='/jobs/view/']")
 
     out = []
     for li in items:
@@ -202,6 +218,9 @@ def parse_jobs_from_html(html: str, label: str, ref_dt: datetime) -> List[Dict[s
         if not m:
             continue
         jid = m.group(1)
+        if jid in seen_ids:
+            continue
+        seen_ids.add(jid)
 
         if li.name == "a":
             title = a.get_text(strip=True)
@@ -219,23 +238,23 @@ def parse_jobs_from_html(html: str, label: str, ref_dt: datetime) -> List[Dict[s
             location = loc_el.get_text(strip=True) if loc_el else ""
             posted_txt = time_el.get_text(strip=True).lower() if time_el else ""
 
+        title, company, location = clean_title_company_location(title, company, location)
         posted_at = linkedin_relative_to_dt(posted_txt, ref_dt).isoformat()
 
         out.append({
             "job_id": jid,
             "title": title,
-            "company": company,
-            "location": location,
+            "company": company or "-",
+            "location": location or "-",
             "url": href.split("?")[0],
             "label": label,
             "posted_at": posted_at
         })
     return out
 
-def upsert_and_classify(jobs: List[Dict[str, Any]]):
-    out_notify, out_queue = [], []
+def upsert_jobs(jobs: List[Dict[str, Any]]):
+    inserted = []
     nowiso = now_ist().isoformat()
-    qhour = is_quiet_hour(now_ist())
     with sqlite3.connect(DB_PATH) as conn:
         c = conn.cursor()
         for j in jobs:
@@ -243,87 +262,48 @@ def upsert_and_classify(jobs: List[Dict[str, Any]]):
             if c.fetchone():
                 continue
             c.execute("""
-                INSERT INTO jobs(job_id, title, company, location, url, label, posted_at, first_seen_at, notified, queued)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 0)
+                INSERT INTO jobs(job_id, title, company, location, url, label, posted_at, first_seen_at, notified)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)
             """, (j["job_id"], j["title"], j["company"], j["location"], j["url"], j["label"], j["posted_at"], nowiso))
-            if qhour:
-                out_queue.append(j)
-                c.execute("UPDATE jobs SET queued=1 WHERE job_id=?", (j["job_id"],))
-            else:
-                out_notify.append(j)
-                c.execute("UPDATE jobs SET notified=1 WHERE job_id=?", (j["job_id"],))
+            inserted.append(j)
         conn.commit()
-    return {"new_to_notify": out_notify, "queued": out_queue}
+    return inserted
 
 async def notify_slack(items: List[Dict[str, Any]], heading: str):
     if not SLACK_WEBHOOK_URL or not items:
+        if not SLACK_WEBHOOK_URL:
+            print("[error] SLACK_WEBHOOK_URL not set; skipping Slack.")
         return
     client = AsyncWebhookClient(SLACK_WEBHOOK_URL)
     lines = [f"*{heading}*"]
     for j in items:
-        company = j['company'] or "-"
-        location = j['location'] or "-"
-        lines.append(f"• *{j['title']}* — {company} ({location})\n<{j['url']}|Apply / View>  — _{j['label']}_")
+        lines.append(f"• *{j['title']}* — {j['company']} ({j['location']})\n<{j['url']}|Apply / View>  — _{j['label']}_")
     await client.send(text="\n".join(lines))
 
-async def notify_email(items: List[Dict[str, Any]], heading: str):
-    if not (EMAIL_FROM and EMAIL_TO and SMTP_HOST and items):
-        return
-    body = [heading, ""]
-    for j in items:
-        body.append(f"{j['title']} — {j['company']} ({j['location']})\n{j['url']}  — {j['label']}\n")
-    msg = MIMEText("\n".join(body))
-    msg["Subject"] = heading
-    msg["From"] = EMAIL_FROM
-    msg["To"] = EMAIL_TO
-    await aiosmtplib.send(msg, hostname=SMTP_HOST, port=SMTP_PORT, start_tls=True, username=SMTP_USER, password=SMTP_PASS)
-
-def fetch_queued_to_flush():
-    with sqlite3.connect(DB_PATH) as conn:
-        c = conn.cursor()
-        rows = c.execute("""
-            SELECT job_id, title, company, location, url, label, posted_at
-            FROM jobs WHERE queued=1 AND notified=0
-        """).fetchall()
-    return [{"job_id": r[0], "title": r[1], "company": r[2], "location": r[3], "url": r[4], "label": r[5], "posted_at": r[6]} for r in rows]
-
-def mark_flushed(ids: List[str]):
-    if not ids:
-        return
-    with sqlite3.connect(DB_PATH) as conn:
-        c = conn.cursor()
-        q = ",".join(["?"] * len(ids))
-        c.execute(f"UPDATE jobs SET queued=0, notified=1 WHERE job_id IN ({q})", ids)
-        conn.commit()
-
 # ================================
-# Run once (hourly via cron/Actions)
+# Main run
 # ================================
 async def run_once():
     init_db()
 
+    if not Path(SEARCHES_PATH).exists():
+        raise FileNotFoundError(f"{SEARCHES_PATH} not found")
+
     with open(SEARCHES_PATH, "r") as f:
         searches = json.load(f)
+
     print("[DEBUG] Loaded searches:", [(s.get("label"), s.get("url")) for s in searches])
 
-    now = now_ist()
-    # 10:00 IST flush for overnight finds
-    if now.hour == 10 and now.minute < 10:
-        queued = fetch_queued_to_flush()
-        if queued:
-            heading = f"Queued LinkedIn jobs from overnight — {now.strftime('%d %b %Y, %H:%M %Z')}"
-            await notify_slack(queued, heading)
-            await notify_email(queued, heading)
-            mark_flushed([j["job_id"] for j in queued])
+    total_parsed = 0
+    total_inserted = 0
+    new_jobs_all: List[Dict[str, Any]] = []
 
     async with async_playwright() as p:
-        profile_dir = str(Path("playwright_profile").resolve())
-        mode = os.getenv("PW_CONTEXT", "persistent").lower()
+        browser = None
         user_agent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0 Safari/537.36"
 
-        browser = None
-        if mode == "storage":
-            # GitHub Actions mode: use storage_state from auth.json supplied via secret
+        if PW_CONTEXT_MODE == "storage":
+            # CI mode: use saved storage_state (auth.json) from secret
             browser = await p.chromium.launch(
                 headless=HEADLESS,
                 args=[
@@ -341,11 +321,11 @@ async def run_once():
                 viewport={"width": 1366, "height": 768}
             )
         else:
-            # Local mode: persistent profile that stays logged in across runs
+            # Local mode: persistent profile
+            profile_dir = str(Path("playwright_profile").resolve())
             context = await p.chromium.launch_persistent_context(
                 user_data_dir=profile_dir,
                 headless=HEADLESS,
-                # channel="chrome",
                 args=[
                     "--disable-blink-features=AutomationControlled",
                     "--no-sandbox",
@@ -360,47 +340,75 @@ async def run_once():
         context.set_default_timeout(GLOBAL_TIMEOUT_MS)
         page = await context.new_page()
 
-        all_new_to_notify = []
-        for idx, s in enumerate(searches, start=1):
+        # Start tracing on CI for post-mortem
+        if IS_CI:
             try:
-                await page.goto(s["url"], wait_until="domcontentloaded", timeout=60000)
-                await page.wait_for_timeout(int(random.uniform(*PAGE_LOAD_SETTLE_RANGE) * 1000))
+                await context.tracing.start(screenshots=True, snapshots=True, sources=False)
+            except Exception:
+                pass
 
-                ready = await settle_and_find(page)
-                print("[debug] URL:", page.url, "ready=", ready)
+        try:
+            for idx, s in enumerate(searches, start=1):
+                url = s["url"]
+                label = s["label"]
 
-                # Only consider it a challenge if both (a) challenge present and (b) no results found
-                if FAIL_FAST_ON_CHALLENGE:
-                    challenge = await is_challenge(page)
-                    if challenge and not ready:
-                        print("[warn] Real challenge detected (no results + checkpoint). Backing off this run.")
-                        break
+                try:
+                    await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+                    await page.wait_for_timeout(int(random.uniform(*PAGE_LOAD_SETTLE_RANGE) * 1000))
 
-                if not ready:
-                    # Not a challenge; just skip this variant quietly
-                    print("[info] No results container found; skipping this search variant.")
-                    continue
+                    ready = await settle_and_find(page)
+                    print(f"[debug] Search {idx}/{len(searches)} url={page.url} ready={ready}")
 
-                html = await page.content()
-                parsed = parse_jobs_from_html(html, s["label"], now_ist())
-                res = upsert_and_classify(parsed)
-                all_new_to_notify.extend(res["new_to_notify"])
+                    if FAIL_FAST_ON_CHALLENGE:
+                        challenge = await is_challenge(page)
+                        if challenge and not ready:
+                            print("[warn] Real challenge detected (checkpoint). Backing off.")
+                            break
 
-                # Inter-search cool-off (randomized)
-                if idx < len(searches):
-                    await page.wait_for_timeout(int(random.uniform(*INTER_SEARCH_SLEEP) * 1000))
+                    if not ready:
+                        print("[info] No results container found; skip.")
+                        # short pause before next query
+                        if idx < len(searches):
+                            await page.wait_for_timeout(int(random.uniform(*INTER_SEARCH_SLEEP) * 1000))
+                        continue
 
-            except Exception as e:
-                print(f"[{s.get('label','?')}] error: {e}")
+                    html = await page.content()
+                    parsed = parse_jobs_from_html(html, label, now_ist())
+                    inserted = upsert_jobs(parsed)
 
-        await context.close()
-        if browser:
-            await browser.close()
+                    total_parsed += len(parsed)
+                    total_inserted += len(inserted)
+                    new_jobs_all.extend(inserted)
 
-    if all_new_to_notify and not is_quiet_hour(now_ist()):
+                    print(f"[summary] {label}: parsed={len(parsed)} inserted_new={len(inserted)}")
+
+                    if idx < len(searches):
+                        await page.wait_for_timeout(int(random.uniform(*INTER_SEARCH_SLEEP) * 1000))
+
+                except Exception as e:
+                    print(f"[{label}] error: {e}")
+
+        finally:
+            # Save trace and close cleanly
+            try:
+                await context.close()
+            finally:
+                if IS_CI:
+                    try:
+                        await context.tracing.stop(path="trace.zip")
+                    except Exception:
+                        pass
+                if 'browser' in locals() and browser:
+                    await browser.close()
+
+    print(f"[summary] parsed_total={total_parsed} inserted_new_total={total_inserted} across {len(searches)} searches")
+
+    if new_jobs_all and not is_quiet_hour(now_ist()):
         heading = f"New LinkedIn jobs — {now_ist().strftime('%d %b %Y, %H:%M %Z')}"
-        await notify_slack(all_new_to_notify, heading)
-        await notify_email(all_new_to_notify, heading)
+        print(f"[summary] sending to Slack: {len(new_jobs_all)} jobs")
+        await notify_slack(new_jobs_all, heading)
+    else:
+        print("[summary] no new jobs to send this run (or quiet hour active).")
 
 async def main():
     await run_once()
