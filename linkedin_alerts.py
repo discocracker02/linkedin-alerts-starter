@@ -293,6 +293,7 @@ async def run_once():
         searches = json.load(f)
 
     print("[DEBUG] Loaded searches:", [(s.get("label"), s.get("url")) for s in searches])
+    print(f"[DEBUG] Slack webhook configured: {bool(SLACK_WEBHOOK_URL)}")
 
     total_parsed = 0
     total_inserted = 0
@@ -358,6 +359,12 @@ async def run_once():
 
                     ready = await settle_and_find(page)
                     print(f"[debug] Search {idx}/{len(searches)} url={page.url} ready={ready}")
+                    try:
+                        snap = f"search_{idx}_{'ready' if ready else 'noready'}_{int(time.time())}.png"
+                        await page.screenshot(path=snap, full_page=True)
+                        print(f"[debug] Saved per-search screenshot: {snap}")
+                    except Exception:
+                        pass
 
                     if FAIL_FAST_ON_CHALLENGE:
                         challenge = await is_challenge(page)
@@ -389,15 +396,15 @@ async def run_once():
                     print(f"[{label}] error: {e}")
 
         finally:
-            # Save trace and close cleanly
+            # Save trace first, then close cleanly
+            if IS_CI:
+                try:
+                    await context.tracing.stop(path="trace.zip")
+                except Exception:
+                    pass
             try:
                 await context.close()
             finally:
-                if IS_CI:
-                    try:
-                        await context.tracing.stop(path="trace.zip")
-                    except Exception:
-                        pass
                 if 'browser' in locals() and browser:
                     await browser.close()
 
