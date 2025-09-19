@@ -3,17 +3,23 @@ name: LinkedIn Alerts (Hourly)
 on:
   schedule:
     - cron: "0 * * * *"   # hourly in UTC
+
+
+
   workflow_dispatch:       # allow manual runs
 
 env:
+
   TZ: Asia/Kolkata
+
+
   PW_CONTEXT: storage      # use storage_state (auth.json) on CI
   HEADLESS: "true"         # headless on Actions
 
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 12
+    timeout-minutes: 25
 
     steps:
       - name: Checkout
@@ -42,3 +48,4 @@ jobs:
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
         run: python linkedin_alerts.py
+
