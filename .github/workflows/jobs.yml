@@ -3,25 +3,10 @@ name: LinkedIn Alerts (Hourly)
 on:
   schedule:
     - cron: "0 * * * *"   # hourly in UTC
-
-
-
-
-
-
-
   workflow_dispatch:       # allow manual runs
 
 env:
-
-
-
   TZ: Asia/Kolkata
-
-
-
-
-
   PW_CONTEXT: storage      # use storage_state (auth.json) on CI
   HEADLESS: "true"         # headless on Actions
 
@@ -65,8 +50,12 @@ jobs:
           name: trace
           path: trace.zip
 
-
-
+      - name: Upload debug screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-shots
+          path: search_*.png
 
 
 
