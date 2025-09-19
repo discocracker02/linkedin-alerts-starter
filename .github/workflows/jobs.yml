@@ -6,11 +6,20 @@ on:
 
 
 
+
+
+
+
   workflow_dispatch:       # allow manual runs
 
 env:
 
+
+
   TZ: Asia/Kolkata
+
+
+
 
 
   PW_CONTEXT: storage      # use storage_state (auth.json) on CI
@@ -48,4 +57,17 @@ jobs:
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
         run: python linkedin_alerts.py
+
+      - name: Upload Playwright trace
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trace
+          path: trace.zip
+
+
+
+
+
+
 
