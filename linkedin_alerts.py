@@ -408,13 +408,18 @@ async def run_once():
 
                     html = await page.content()
                     parsed = parse_jobs_from_html(html, label, now_ist())
-                    inserted = upsert_jobs(parsed)
+                    cutoff = now_ist() - timedelta(hours=24)
+                    filtered = [
+                        j for j in parsed
+                        if datetime.fromisoformat(j["posted_at"]) >= cutoff
+                    ]
+                    inserted = upsert_jobs(filtered)
 
                     total_parsed += len(parsed)
                     total_inserted += len(inserted)
                     new_jobs_all.extend(inserted)
 
-                    print(f"[summary] {label}: parsed={len(parsed)} inserted_new={len(inserted)}")
+                    print(f"[summary] {label}: parsed={len(parsed)} filtered={len(filtered)} inserted_new={len(inserted)}")
 
                     if idx < len(searches):
                         await page.wait_for_timeout(int(random.uniform(*INTER_SEARCH_SLEEP) * 1000))
