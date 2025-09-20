@@ -18,6 +18,7 @@ DB_PATH = "jobs.db"
 SEARCHES_PATH = "searches.json"
 
 SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL")
+FRESH_HOURS = int(os.getenv("FRESH_HOURS", "6"))
 HEARTBEAT = os.getenv("HEARTBEAT", "true").lower() == "true"  # send heartbeat when 0 jobs
 
 # Quiet hours DISABLED (send 24×7 as requested)
@@ -300,7 +301,7 @@ async def send_heartbeat(count: int):
         return
     client = AsyncWebhookClient(SLACK_WEBHOOK_URL)
     ts = now_ist().strftime('%d %b %Y, %H:%M %Z')
-    text = f"Heartbeat — pipeline OK at {ts}. New jobs this run: {count}."
+    text = f"Heartbeat — pipeline OK at {ts}. New jobs this run (≤{FRESH_HOURS}h): {count}."
     try:
         resp = await client.send(text=text)
         code = getattr(resp, "status_code", None)
@@ -408,7 +409,7 @@ async def run_once():
 
                     html = await page.content()
                     parsed = parse_jobs_from_html(html, label, now_ist())
-                    cutoff = now_ist() - timedelta(hours=24)
+                    cutoff = now_ist() - timedelta(hours=FRESH_HOURS)
                     filtered = [
                         j for j in parsed
                         if datetime.fromisoformat(j["posted_at"]) >= cutoff
@@ -443,7 +444,7 @@ async def run_once():
     print(f"[summary] parsed_total={total_parsed} inserted_new_total={total_inserted} across {len(searches)} searches")
 
     if new_jobs_all and not is_quiet_hour(now_ist()):
-        heading = f"New LinkedIn jobs — {now_ist().strftime('%d %b %Y, %H:%M %Z')}"
+        heading = f"New LinkedIn jobs (≤{FRESH_HOURS}h) — {now_ist().strftime('%d %b %Y, %H:%M %Z')}"
         print(f"[summary] sending to Slack: {len(new_jobs_all)} jobs")
         await notify_slack(new_jobs_all, heading)
     else:
