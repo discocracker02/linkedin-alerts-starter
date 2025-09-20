@@ -6,3 +6,4 @@ auth.json
 playwright_profile/
 debug_*.png
 jobs.db
+.DS_Store
