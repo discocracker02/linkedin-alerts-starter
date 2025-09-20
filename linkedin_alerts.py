@@ -1,4 +1,3 @@
-# linkedin_alerts.py
 import asyncio, json, os, re, sqlite3, pytz, time, random
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -19,6 +18,7 @@ DB_PATH = "jobs.db"
 SEARCHES_PATH = "searches.json"
 
 SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL")
+HEARTBEAT = os.getenv("HEARTBEAT", "true").lower() == "true"  # send heartbeat when 0 jobs
 
 # Quiet hours DISABLED (send 24×7 as requested)
 QUIET_START = 0
@@ -277,8 +277,36 @@ async def notify_slack(items: List[Dict[str, Any]], heading: str):
     client = AsyncWebhookClient(SLACK_WEBHOOK_URL)
     lines = [f"*{heading}*"]
     for j in items:
-        lines.append(f"• *{j['title']}* — {j['company']} ({j['location']})\n<{j['url']}|Apply / View>  — _{j['label']}_")
-    await client.send(text="\n".join(lines))
+        company = j.get('company') or "-"
+        location = j.get('location') or "-"
+        lines.append(
+            f"• *{j['title']}* — {company} ({location})\n"
+            f"<{j['url']}|Apply / View>  — _{j['label']}_"
+        )
+
+    text = "\n".join(lines)
+    try:
+        resp = await client.send(text=text)
+        code = getattr(resp, "status_code", None)
+        body = getattr(resp, "body", None)
+        ok = (code == 200)
+        print(f"[slack] sent={ok} status={code} body={body!r} chars={len(text)}")
+    except Exception as e:
+        print(f"[slack] send failed: {e}")
+
+async def send_heartbeat(count: int):
+    """Optional heartbeat when no new jobs, controlled by HEARTBEAT env."""
+    if not HEARTBEAT or not SLACK_WEBHOOK_URL:
+        return
+    client = AsyncWebhookClient(SLACK_WEBHOOK_URL)
+    ts = now_ist().strftime('%d %b %Y, %H:%M %Z')
+    text = f"Heartbeat — pipeline OK at {ts}. New jobs this run: {count}."
+    try:
+        resp = await client.send(text=text)
+        code = getattr(resp, "status_code", None)
+        print(f"[slack] heartbeat status={code}")
+    except Exception as e:
+        print(f"[slack] heartbeat failed: {e}")
 
 # ================================
 # Main run
@@ -374,7 +402,6 @@ async def run_once():
 
                     if not ready:
                         print("[info] No results container found; skip.")
-                        # short pause before next query
                         if idx < len(searches):
                             await page.wait_for_timeout(int(random.uniform(*INTER_SEARCH_SLEEP) * 1000))
                         continue
@@ -416,6 +443,8 @@ async def run_once():
         await notify_slack(new_jobs_all, heading)
     else:
         print("[summary] no new jobs to send this run (or quiet hour active).")
+        # Heartbeat when zero results, so you still get a proof-of-life
+        await send_heartbeat(len(new_jobs_all))
 
 async def main():
     await run_once()
