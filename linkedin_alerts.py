@@ -87,6 +87,13 @@ def linkedin_relative_to_dt(txt: str, ref_dt: datetime) -> datetime:
 def _collapse_ws(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "").strip())
 
+def _parse_iso_ts(s: str) -> datetime:
+    if not s:
+        raise ValueError("empty ts")
+    # Normalize 'Z' (UTC) to '+00:00' for Python's fromisoformat
+    s2 = s.replace('Z', '+00:00')
+    return datetime.fromisoformat(s2)
+
 def clean_title_company_location(title: str, company: str, location: str) -> tuple:
     # Strip badges like "with verification"/"verified"
     def strip_badges(x: str) -> str:
@@ -224,11 +231,8 @@ def parse_jobs_from_html(html: str, label: str, ref_dt: datetime) -> List[Dict[s
         seen_ids.add(jid)
 
         if li.name == "a":
-            title = a.get_text(strip=True)
-            company = ""
-            location = ""
-            posted_txt = ""
-            posted_at = linkedin_relative_to_dt(posted_txt, ref_dt).isoformat()
+            # Skip bare anchor entries without surrounding card metadata (often ads or stale links)
+            continue
         else:
             title_el = li.select_one(".base-search-card__title, .job-card-list__title, .sr-only, .result-card__title, h3")
             comp_el  = li.select_one(".base-search-card__subtitle, .job-card-container__company-name, .job-card-company-name, .result-card__subtitle, a[href*='/company/']")
@@ -416,19 +420,29 @@ async def run_once():
                     html = await page.content()
                     parsed = parse_jobs_from_html(html, label, now_ist())
                     cutoff = now_ist() - timedelta(hours=FRESH_HOURS)
-                    filtered = [
-                        j for j in parsed
-                        if datetime.fromisoformat(j["posted_at"]) >= cutoff
-                    ]
+                    filtered = []
+                    dropped_invalid = 0
+                    dropped_stale = 0
+                    for j in parsed:
+                        try:
+                            dtp = _parse_iso_ts(j.get("posted_at", ""))
+                        except Exception:
+                            dropped_invalid += 1
+                            continue
+                        if dtp >= cutoff:
+                            filtered.append(j)
+                        else:
+                            dropped_stale += 1
                     # Diagnostics: show cutoff and timestamp range we saw
                     try:
-                        parsed_times = [datetime.fromisoformat(j["posted_at"]) for j in parsed if j.get("posted_at")]
+                        parsed_times = [_parse_iso_ts(j["posted_at"]) for j in parsed if j.get("posted_at")]
                         if parsed_times:
                             oldest = min(parsed_times)
                             newest = max(parsed_times)
                             print(f"[debug] {label}: cutoff={cutoff.isoformat()} oldest_seen={oldest.isoformat()} newest_seen={newest.isoformat()}")
                     except Exception:
                         pass
+                    print(f"[debug] {label}: dropped_invalid_ts={dropped_invalid} dropped_stale={dropped_stale}")
                     inserted = upsert_jobs(filtered)
 
                     total_parsed += len(parsed)
