@@ -228,6 +228,7 @@ def parse_jobs_from_html(html: str, label: str, ref_dt: datetime) -> List[Dict[s
             company = ""
             location = ""
             posted_txt = ""
+            posted_at = linkedin_relative_to_dt(posted_txt, ref_dt).isoformat()
         else:
             title_el = li.select_one(".base-search-card__title, .job-card-list__title, .sr-only, .result-card__title, h3")
             comp_el  = li.select_one(".base-search-card__subtitle, .job-card-container__company-name, .job-card-company-name, .result-card__subtitle, a[href*='/company/']")
@@ -237,10 +238,15 @@ def parse_jobs_from_html(html: str, label: str, ref_dt: datetime) -> List[Dict[s
             title = (title_el.get_text(strip=True) if title_el else a.get_text(strip=True))
             company = comp_el.get_text(strip=True) if comp_el else ""
             location = loc_el.get_text(strip=True) if loc_el else ""
-            posted_txt = time_el.get_text(strip=True).lower() if time_el else ""
+
+            # Prefer machine timestamp if present; fall back to relative-text parsing
+            if time_el and time_el.has_attr("datetime"):
+                posted_at = time_el["datetime"]
+            else:
+                posted_txt = time_el.get_text(strip=True).lower() if time_el else ""
+                posted_at = linkedin_relative_to_dt(posted_txt, ref_dt).isoformat()
 
         title, company, location = clean_title_company_location(title, company, location)
-        posted_at = linkedin_relative_to_dt(posted_txt, ref_dt).isoformat()
 
         out.append({
             "job_id": jid,
@@ -414,6 +420,15 @@ async def run_once():
                         j for j in parsed
                         if datetime.fromisoformat(j["posted_at"]) >= cutoff
                     ]
+                    # Diagnostics: show cutoff and timestamp range we saw
+                    try:
+                        parsed_times = [datetime.fromisoformat(j["posted_at"]) for j in parsed if j.get("posted_at")]
+                        if parsed_times:
+                            oldest = min(parsed_times)
+                            newest = max(parsed_times)
+                            print(f"[debug] {label}: cutoff={cutoff.isoformat()} oldest_seen={oldest.isoformat()} newest_seen={newest.isoformat()}")
+                    except Exception:
+                        pass
                     inserted = upsert_jobs(filtered)
 
                     total_parsed += len(parsed)
