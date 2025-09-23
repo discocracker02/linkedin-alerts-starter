@@ -1,7 +1,8 @@
+# linkedin_alerts.py
 import asyncio, json, os, re, sqlite3, pytz, time, random
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 
 from dotenv import load_dotenv
 from bs4 import BeautifulSoup
@@ -18,10 +19,10 @@ DB_PATH = "jobs.db"
 SEARCHES_PATH = "searches.json"
 
 SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL")
-FRESH_HOURS = int(os.getenv("FRESH_HOURS", "6"))
+FRESH_HOURS = int(os.getenv("FRESH_HOURS", "24"))  # <= freshness window (default 24h)
 HEARTBEAT = os.getenv("HEARTBEAT", "true").lower() == "true"  # send heartbeat when 0 jobs
 
-# Quiet hours DISABLED (send 24×7 as requested)
+# Quiet hours DISABLED (send 24×7)
 QUIET_START = 0
 QUIET_END = 0
 
@@ -68,31 +69,66 @@ def is_quiet_hour(dt: datetime) -> bool:
     # disabled
     return QUIET_START <= dt.hour < QUIET_END if (QUIET_START or QUIET_END) else False
 
-def linkedin_relative_to_dt(txt: str, ref_dt: datetime) -> datetime:
-    txt = (txt or "").strip().lower()
-    if not txt or "just now" in txt:
-        return ref_dt
-    m = re.search(r"(\d+)\s+(minute|hour|day|week)s?\s+ago", txt)
-    if not m:
-        return ref_dt
-    n, unit = int(m.group(1)), m.group(2)
-    delta = {
-        "minute": timedelta(minutes=n),
-        "hour": timedelta(hours=n),
-        "day": timedelta(days=n),
-        "week": timedelta(weeks=n),
-    }.get(unit, timedelta(0))
-    return ref_dt - delta
-
 def _collapse_ws(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "").strip())
 
 def _parse_iso_ts(s: str) -> datetime:
+    """Parse ISO 8601 safely. Normalize 'Z' to '+00:00'. Assume UTC if naive, then convert to IST."""
     if not s:
         raise ValueError("empty ts")
-    # Normalize 'Z' (UTC) to '+00:00' for Python's fromisoformat
     s2 = s.replace('Z', '+00:00')
-    return datetime.fromisoformat(s2)
+    dt = datetime.fromisoformat(s2)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=pytz.UTC)
+    return dt.astimezone(TZ)
+
+def linkedin_relative_to_dt(txt: str, ref_dt: datetime) -> Optional[datetime]:
+    """Parse relative time strings from LinkedIn. Return None if unknown."""
+    txt = (txt or "").strip().lower()
+
+    if not txt or "just now" in txt or "moments ago" in txt:
+        return ref_dt
+
+    # today / yesterday -> use start of day (IST)
+    start_today = ref_dt.replace(hour=0, minute=0, second=0, microsecond=0)
+    if "today" in txt:
+        return start_today
+    if "yesterday" in txt:
+        return start_today - timedelta(days=1)
+
+    # 30+ days ago (LinkedIn sometimes shows this)
+    if re.search(r"\b30\+?\s*days?\b", txt):
+        return ref_dt - timedelta(days=31)
+
+    patterns = [
+        r"(\d+)\s+(minute|hour|day|week|month)s?\s+ago",
+        r"(\d+)\s*(min|mins|minute|hr|hrs|h|d|w|wk|wks|mo|mon|month)s?\s*ago",
+        r"about\s+(\d+)\s+(minute|hour|day|week|month)s?\s+ago",
+        r"over\s+(\d+)\s+(minute|hour|day|week|month)s?\s+ago",
+    ]
+    unit_map = {
+        "min":"minute","mins":"minute","minute":"minute",
+        "hr":"hour","hrs":"hour","h":"hour",
+        "d":"day",
+        "w":"week","wk":"week","wks":"week",
+        "mo":"month","mon":"month","month":"month",
+    }
+    for pat in patterns:
+        m = re.search(pat, txt)
+        if m:
+            n = int(m.group(1))
+            unit = unit_map.get(m.group(2), m.group(2))
+            delta = {
+                "minute": timedelta(minutes=n),
+                "hour":   timedelta(hours=n),
+                "day":    timedelta(days=n),
+                "week":   timedelta(weeks=n),
+                "month":  timedelta(days=30*n),  # coarse, good enough for freshness gate
+            }.get(unit)
+            if delta:
+                return ref_dt - delta
+
+    return None  # unknown → caller must drop
 
 def clean_title_company_location(title: str, company: str, location: str) -> tuple:
     # Strip badges like "with verification"/"verified"
@@ -230,25 +266,36 @@ def parse_jobs_from_html(html: str, label: str, ref_dt: datetime) -> List[Dict[s
             continue
         seen_ids.add(jid)
 
+        # Skip bare anchors (no metadata — often ads or stale links)
         if li.name == "a":
-            # Skip bare anchor entries without surrounding card metadata (often ads or stale links)
             continue
-        else:
-            title_el = li.select_one(".base-search-card__title, .job-card-list__title, .sr-only, .result-card__title, h3")
-            comp_el  = li.select_one(".base-search-card__subtitle, .job-card-container__company-name, .job-card-company-name, .result-card__subtitle, a[href*='/company/']")
-            loc_el   = li.select_one(".job-search-card__location, .result-card__meta .job-result-card__location, .job-card-container__metadata-item")
-            time_el  = li.select_one("time")
 
-            title = (title_el.get_text(strip=True) if title_el else a.get_text(strip=True))
-            company = comp_el.get_text(strip=True) if comp_el else ""
-            location = loc_el.get_text(strip=True) if loc_el else ""
+        title_el = li.select_one(".base-search-card__title, .job-card-list__title, .sr-only, .result-card__title, h3")
+        comp_el  = li.select_one(".base-search-card__subtitle, .job-card-container__company-name, .job-card-company-name, .result-card__subtitle, a[href*='/company/']")
+        loc_el   = li.select_one(".job-search-card__location, .result-card__meta .job-result-card__location, .job-card-container__metadata-item")
+        time_el  = li.select_one("time")  # LinkedIn usually uses <time datetime="...">
 
-            # Prefer machine timestamp if present; fall back to relative-text parsing
-            if time_el and time_el.has_attr("datetime"):
-                posted_at = time_el["datetime"]
-            else:
-                posted_txt = time_el.get_text(strip=True).lower() if time_el else ""
-                posted_at = linkedin_relative_to_dt(posted_txt, ref_dt).isoformat()
+        title = (title_el.get_text(strip=True) if title_el else a.get_text(strip=True))
+        company = comp_el.get_text(strip=True) if comp_el else ""
+        location = loc_el.get_text(strip=True) if loc_el else ""
+
+        # Timestamp: prefer machine datetime, fallback to relative text
+        posted_at_iso: Optional[str] = None
+        if time_el and time_el.has_attr("datetime"):
+            try:
+                posted_dt = _parse_iso_ts(time_el["datetime"])
+                posted_at_iso = posted_dt.isoformat()
+            except Exception:
+                posted_at_iso = None
+
+        if not posted_at_iso:
+            posted_txt = time_el.get_text(strip=True) if time_el else ""
+            parsed_dt = linkedin_relative_to_dt(posted_txt, ref_dt)
+            posted_at_iso = parsed_dt.isoformat() if parsed_dt else None
+
+        # If still unknown, skip the record
+        if not posted_at_iso:
+            continue
 
         title, company, location = clean_title_company_location(title, company, location)
 
@@ -259,7 +306,7 @@ def parse_jobs_from_html(html: str, label: str, ref_dt: datetime) -> List[Dict[s
             "location": location or "-",
             "url": href.split("?")[0],
             "label": label,
-            "posted_at": posted_at
+            "posted_at": posted_at_iso
         })
     return out
 
@@ -419,6 +466,8 @@ async def run_once():
 
                     html = await page.content()
                     parsed = parse_jobs_from_html(html, label, now_ist())
+
+                    # Strict freshness filtering BEFORE insert
                     cutoff = now_ist() - timedelta(hours=FRESH_HOURS)
                     filtered = []
                     dropped_invalid = 0
@@ -433,23 +482,16 @@ async def run_once():
                             filtered.append(j)
                         else:
                             dropped_stale += 1
-                    # Diagnostics: show cutoff and timestamp range we saw
-                    try:
-                        parsed_times = [_parse_iso_ts(j["posted_at"]) for j in parsed if j.get("posted_at")]
-                        if parsed_times:
-                            oldest = min(parsed_times)
-                            newest = max(parsed_times)
-                            print(f"[debug] {label}: cutoff={cutoff.isoformat()} oldest_seen={oldest.isoformat()} newest_seen={newest.isoformat()}")
-                    except Exception:
-                        pass
-                    print(f"[debug] {label}: dropped_invalid_ts={dropped_invalid} dropped_stale={dropped_stale}")
+
                     inserted = upsert_jobs(filtered)
 
                     total_parsed += len(parsed)
                     total_inserted += len(inserted)
                     new_jobs_all.extend(inserted)
 
-                    print(f"[summary] {label}: parsed={len(parsed)} filtered={len(filtered)} inserted_new={len(inserted)}")
+                    print(f"[summary] {label}: parsed={len(parsed)} filtered={len(filtered)} "
+                          f"dropped_invalid_ts={dropped_invalid} dropped_stale={dropped_stale} "
+                          f"inserted_new={len(inserted)}")
 
                     if idx < len(searches):
                         await page.wait_for_timeout(int(random.uniform(*INTER_SEARCH_SLEEP) * 1000))
