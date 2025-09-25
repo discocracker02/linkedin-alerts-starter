@@ -284,6 +284,9 @@ async def settle_and_find(page) -> bool:
         pass
     return False
 
+# Add this enhanced parse_jobs_from_html function to your existing code
+# Replace the existing function completely
+
 def parse_jobs_from_html(html: str, label: str, ref_dt: datetime) -> List[Dict[str, Any]]:
     soup = BeautifulSoup(html, "html.parser")
     seen_ids = set()
@@ -330,6 +333,14 @@ def parse_jobs_from_html(html: str, label: str, ref_dt: datetime) -> List[Dict[s
 
         print(f"[PARSE_DEBUG] Processing job {jid}")
         
+        # DEBUG: Print the entire HTML structure of this job card
+        print(f"[HTML_DEBUG] Job {jid} full HTML structure:")
+        print("-" * 80)
+        print(li.prettify()[:2000])  # First 2000 chars
+        if len(li.prettify()) > 2000:
+            print("... [TRUNCATED] ...")
+        print("-" * 80)
+        
         # Enhanced element selection with more selectors
         title_el = li.select_one("""
             .base-search-card__title, 
@@ -359,15 +370,6 @@ def parse_jobs_from_html(html: str, label: str, ref_dt: datetime) -> List[Dict[s
             .job-result-card__location,
             .job-card-container__metadata-wrapper span
         """)
-        
-        # Enhanced time element selection
-        time_el = li.select_one("""
-            time,
-            .job-search-card__listdate,
-            .job-result-card__listdate,
-            .job-card-container__metadata-item time,
-            .job-card-list__footer-wrapper time
-        """)
 
         title = (title_el.get_text(strip=True) if title_el else a.get_text(strip=True))
         company = comp_el.get_text(strip=True) if comp_el else ""
@@ -375,60 +377,116 @@ def parse_jobs_from_html(html: str, label: str, ref_dt: datetime) -> List[Dict[s
         
         print(f"[PARSE_DEBUG] Job {jid}: {title[:50]}... at {company}")
 
-        # Enhanced timestamp parsing with comprehensive fallback
+        # ULTRA-COMPREHENSIVE timestamp detection
         posted_at_iso: Optional[str] = None
         timestamp_source = "none"
         
-        # Try machine datetime first
-        if time_el and time_el.has_attr("datetime"):
+        # Method 1: Look for ANY element with datetime attribute
+        datetime_elements = li.select("[datetime]")
+        print(f"[TIME_DEBUG] Found {len(datetime_elements)} elements with datetime attribute")
+        
+        for dt_el in datetime_elements:
+            datetime_val = dt_el.get("datetime")
+            print(f"[TIME_DEBUG] datetime element: {dt_el.name} with datetime='{datetime_val}'")
             try:
-                posted_dt = _parse_iso_ts(time_el["datetime"])
+                posted_dt = _parse_iso_ts(datetime_val)
                 posted_at_iso = posted_dt.isoformat()
-                timestamp_source = f"datetime_attr: {time_el['datetime']}"
-                print(f"[PARSE_DEBUG] Job {jid}: Found datetime attribute: {time_el['datetime']}")
+                timestamp_source = f"datetime_attr: {datetime_val}"
+                print(f"[TIME_DEBUG] SUCCESS: Parsed datetime='{datetime_val}' -> {posted_at_iso}")
+                break
             except Exception as e:
-                print(f"[PARSE_DEBUG] Job {jid}: Failed to parse datetime='{time_el.get('datetime')}': {e}")
+                print(f"[TIME_DEBUG] FAILED to parse datetime='{datetime_val}': {e}")
 
-        # Fallback to relative text parsing
+        # Method 2: Look for time elements specifically
         if not posted_at_iso:
-            timestamp_candidates = []
+            time_elements = li.select("time")
+            print(f"[TIME_DEBUG] Found {len(time_elements)} <time> elements")
             
-            # From time element text
-            if time_el:
-                timestamp_candidates.append(time_el.get_text(strip=True))
+            for time_el in time_elements:
+                print(f"[TIME_DEBUG] <time> element HTML: {time_el}")
+                if time_el.has_attr("datetime"):
+                    try:
+                        posted_dt = _parse_iso_ts(time_el["datetime"])
+                        posted_at_iso = posted_dt.isoformat()
+                        timestamp_source = f"time_datetime: {time_el['datetime']}"
+                        print(f"[TIME_DEBUG] SUCCESS: time element datetime -> {posted_at_iso}")
+                        break
+                    except Exception as e:
+                        print(f"[TIME_DEBUG] FAILED time element datetime: {e}")
+
+        # Method 3: Search ALL text content for time patterns
+        if not posted_at_iso:
+            print(f"[TIME_DEBUG] Searching all text content for timestamp patterns...")
+            all_text_elements = li.find_all(string=True)
+            time_candidates = []
             
-            # Look for time info in various spans and metadata
-            for selector in [
-                "span:contains('ago')",
-                "span:contains('today')", 
-                "span:contains('yesterday')",
-                "span:contains('just now')",
-                ".job-card-container__metadata-item",
-                ".job-result-card__listdate"
-            ]:
-                elements = li.select(selector)
-                for el in elements:
-                    text = el.get_text(strip=True).lower()
-                    if any(keyword in text for keyword in ['ago', 'today', 'yesterday', 'just now', 'moment']):
-                        timestamp_candidates.append(el.get_text(strip=True))
+            for text in all_text_elements:
+                text_clean = text.strip()
+                if text_clean and any(keyword in text_clean.lower() for keyword in 
+                    ['ago', 'today', 'yesterday', 'just now', 'moment', 'hour', 'day', 'week', 'month']):
+                    time_candidates.append(text_clean)
+                    print(f"[TIME_DEBUG] Found time candidate in text: '{text_clean}'")
             
             # Try parsing each candidate
-            for candidate in timestamp_candidates:
-                if candidate and candidate.strip():
-                    print(f"[PARSE_DEBUG] Job {jid}: Trying timestamp candidate: '{candidate}'")
-                    parsed_dt = linkedin_relative_to_dt(candidate, ref_dt)
-                    if parsed_dt:
-                        posted_at_iso = parsed_dt.isoformat()
-                        timestamp_source = f"relative_text: {candidate}"
-                        break
+            for candidate in time_candidates:
+                print(f"[TIME_DEBUG] Trying to parse candidate: '{candidate}'")
+                parsed_dt = linkedin_relative_to_dt(candidate, ref_dt)
+                if parsed_dt:
+                    posted_at_iso = parsed_dt.isoformat()
+                    timestamp_source = f"text_content: {candidate}"
+                    print(f"[TIME_DEBUG] SUCCESS: text parsing -> {posted_at_iso}")
+                    break
+
+        # Method 4: Look for data attributes that might contain timestamps
+        if not posted_at_iso:
+            print(f"[TIME_DEBUG] Checking data attributes...")
+            for attr in li.attrs:
+                if 'time' in attr.lower() or 'date' in attr.lower():
+                    attr_value = li.attrs[attr]
+                    print(f"[TIME_DEBUG] Found time-related attribute: {attr}='{attr_value}'")
+                    try:
+                        if isinstance(attr_value, str) and len(attr_value) > 8:  # Could be a timestamp
+                            parsed_dt = _parse_iso_ts(attr_value)
+                            posted_at_iso = parsed_dt.isoformat()
+                            timestamp_source = f"data_attr: {attr}={attr_value}"
+                            print(f"[TIME_DEBUG] SUCCESS: data attribute -> {posted_at_iso}")
+                            break
+                    except Exception:
+                        continue
+
+        # Method 5: Look in nested elements more aggressively
+        if not posted_at_iso:
+            print(f"[TIME_DEBUG] Deep searching nested elements...")
+            
+            # Get all elements and check their text
+            all_nested = li.find_all()
+            for nested_el in all_nested:
+                element_text = nested_el.get_text(strip=True)
+                if element_text and len(element_text) < 50:  # Reasonable timestamp length
+                    if any(keyword in element_text.lower() for keyword in ['ago', 'today', 'yesterday']):
+                        print(f"[TIME_DEBUG] Checking nested element {nested_el.name}: '{element_text}'")
+                        parsed_dt = linkedin_relative_to_dt(element_text, ref_dt)
+                        if parsed_dt:
+                            posted_at_iso = parsed_dt.isoformat()
+                            timestamp_source = f"nested_text: {element_text}"
+                            print(f"[TIME_DEBUG] SUCCESS: nested element -> {posted_at_iso}")
+                            break
 
         print(f"[PARSE_DEBUG] Job {jid}: Timestamp source = {timestamp_source}")
         print(f"[PARSE_DEBUG] Job {jid}: Final timestamp = {posted_at_iso}")
 
-        # If still no timestamp, skip the job
+        # If still no timestamp found, we need to make a decision
         if not posted_at_iso:
-            print(f"[PARSE_DEBUG] Job {jid}: No timestamp found, SKIPPING")
-            continue
+            print(f"[PARSE_DEBUG] Job {jid}: No timestamp found after all methods")
+            
+            # OPTION A: Skip the job (current behavior)
+            # print(f"[PARSE_DEBUG] Job {jid}: SKIPPING due to no timestamp")
+            # continue
+            
+            # OPTION B: Assume it's fresh and use current time (risky but includes more jobs)
+            print(f"[PARSE_DEBUG] Job {jid}: ASSUMING FRESH - using current time as fallback")
+            posted_at_iso = ref_dt.isoformat()
+            timestamp_source = "fallback_current_time"
 
         title, company, location = clean_title_company_location(title, company, location)
 
