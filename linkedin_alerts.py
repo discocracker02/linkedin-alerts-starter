@@ -83,52 +83,100 @@ def _parse_iso_ts(s: str) -> datetime:
     return dt.astimezone(TZ)
 
 def linkedin_relative_to_dt(txt: str, ref_dt: datetime) -> Optional[datetime]:
-    """Parse relative time strings from LinkedIn. Return None if unknown."""
+    """Parse relative time strings from LinkedIn with comprehensive patterns and debug logging."""
+    original_txt = txt
     txt = (txt or "").strip().lower()
+    
+    print(f"[TIME_DEBUG] Parsing timestamp text: '{original_txt}' -> '{txt}'")
 
-    if not txt or "just now" in txt or "moments ago" in txt:
+    if not txt:
+        print("[TIME_DEBUG] Empty text, returning None")
+        return None
+        
+    if "just now" in txt or "moments ago" in txt or "now" == txt:
+        print(f"[TIME_DEBUG] 'Just now' detected, using ref_dt: {ref_dt.isoformat()}")
         return ref_dt
 
     # today / yesterday -> use start of day (IST)
     start_today = ref_dt.replace(hour=0, minute=0, second=0, microsecond=0)
     if "today" in txt:
-        return start_today
+        result = start_today
+        print(f"[TIME_DEBUG] 'Today' detected, using: {result.isoformat()}")
+        return result
     if "yesterday" in txt:
-        return start_today - timedelta(days=1)
+        result = start_today - timedelta(days=1)
+        print(f"[TIME_DEBUG] 'Yesterday' detected, using: {result.isoformat()}")
+        return result
 
-    # 30+ days ago (LinkedIn sometimes shows this)
+    # Handle "30+ days ago" or similar
     if re.search(r"\b30\+?\s*days?\b", txt):
-        return ref_dt - timedelta(days=31)
+        result = ref_dt - timedelta(days=31)
+        print(f"[TIME_DEBUG] '30+ days' detected, using: {result.isoformat()}")
+        return result
 
+    # Comprehensive patterns for relative timestamps
     patterns = [
-        r"(\d+)\s+(minute|hour|day|week|month)s?\s+ago",
-        r"(\d+)\s*(min|mins|minute|hr|hrs|h|d|w|wk|wks|mo|mon|month)s?\s*ago",
-        r"about\s+(\d+)\s+(minute|hour|day|week|month)s?\s+ago",
-        r"over\s+(\d+)\s+(minute|hour|day|week|month)s?\s+ago",
+        # Standard formats
+        r"(\d+)\s+(second|minute|hour|day|week|month|year)s?\s+ago",
+        # Abbreviated formats
+        r"(\d+)\s*(s|sec|secs|m|min|mins|h|hr|hrs|d|w|wk|wks|mo|mon|months?|y|yr|yrs|years?)\s*ago",
+        # With "about", "over", "more than" etc.
+        r"(?:about|over|more than|nearly)\s+(\d+)\s+(second|minute|hour|day|week|month|year)s?\s+ago",
+        r"(?:about|over|more than|nearly)\s+(\d+)\s*(s|sec|secs|m|min|mins|h|hr|hrs|d|w|wk|wks|mo|mon|months?|y|yr|yrs|years?)\s*ago",
+        # Edge cases
+        r"(\d+)\+\s+(day|week|month)s?\s+ago",  # "1+ days ago"
+        r"a\s+(second|minute|hour|day|week|month|year)\s+ago",  # "a day ago"
+        r"an\s+(hour|day|week|month|year)\s+ago",  # "an hour ago"
     ]
+    
     unit_map = {
-        "min":"minute","mins":"minute","minute":"minute",
-        "hr":"hour","hrs":"hour","h":"hour",
-        "d":"day",
-        "w":"week","wk":"week","wks":"week",
-        "mo":"month","mon":"month","month":"month",
+        # Time units
+        "s": "second", "sec": "second", "secs": "second", "second": "second",
+        "m": "minute", "min": "minute", "mins": "minute", "minute": "minute",
+        "h": "hour", "hr": "hour", "hrs": "hour", "hour": "hour",
+        "d": "day", "day": "day",
+        "w": "week", "wk": "week", "wks": "week", "week": "week",
+        "mo": "month", "mon": "month", "month": "month", "months": "month",
+        "y": "year", "yr": "year", "yrs": "year", "year": "year", "years": "year",
     }
-    for pat in patterns:
+    
+    for i, pat in enumerate(patterns):
         m = re.search(pat, txt)
         if m:
-            n = int(m.group(1))
-            unit = unit_map.get(m.group(2), m.group(2))
-            delta = {
+            print(f"[TIME_DEBUG] Pattern {i+1} matched: {pat}")
+            print(f"[TIME_DEBUG] Match groups: {m.groups()}")
+            
+            # Handle "a/an" cases
+            if m.group(1) in ['a', 'an']:
+                n = 1
+                unit = m.group(2) if len(m.groups()) > 1 else m.group(1)
+            else:
+                n = int(m.group(1))
+                unit = m.group(2) if len(m.groups()) > 1 else "day"  # fallback
+            
+            unit = unit_map.get(unit.lower(), unit.lower())
+            print(f"[TIME_DEBUG] Parsed: {n} {unit}(s) ago")
+            
+            delta_map = {
+                "second": timedelta(seconds=n),
                 "minute": timedelta(minutes=n),
                 "hour":   timedelta(hours=n),
                 "day":    timedelta(days=n),
                 "week":   timedelta(weeks=n),
-                "month":  timedelta(days=30*n),  # coarse, good enough for freshness gate
-            }.get(unit)
+                "month":  timedelta(days=30*n),  # coarse approximation
+                "year":   timedelta(days=365*n), # coarse approximation
+            }
+            
+            delta = delta_map.get(unit)
             if delta:
-                return ref_dt - delta
+                result = ref_dt - delta
+                print(f"[TIME_DEBUG] Calculated timestamp: {result.isoformat()}")
+                return result
+            else:
+                print(f"[TIME_DEBUG] Unknown unit '{unit}', skipping")
 
-    return None  # unknown → caller must drop
+    print(f"[TIME_DEBUG] No patterns matched for '{original_txt}', returning None")
+    return None
 
 def clean_title_company_location(title: str, company: str, location: str) -> tuple:
     # Strip badges like "with verification"/"verified"
@@ -250,56 +298,141 @@ def parse_jobs_from_html(html: str, label: str, ref_dt: datetime) -> List[Dict[s
     if not items:
         items = soup.select("a[href*='/jobs/view/']")
 
+    print(f"[PARSE_DEBUG] Found {len(items)} job items to process")
+
     out = []
-    for li in items:
+    for idx, li in enumerate(items):
+        print(f"\n[PARSE_DEBUG] Processing item {idx+1}/{len(items)}")
+        
         a = li if li.name == "a" else li.select_one("a.base-card__full-link, a.job-card-list__title, a[href*='/jobs/view/']")
         if not a:
+            print("[PARSE_DEBUG] No anchor found, skipping")
             continue
+            
         href = a.get("href") or ""
         if href.startswith("/"):
             href = "https://www.linkedin.com" + href
         m = re.search(r"/jobs/view/(\d+)", href)
         if not m:
+            print(f"[PARSE_DEBUG] No job ID in href: {href}")
             continue
+            
         jid = m.group(1)
         if jid in seen_ids:
+            print(f"[PARSE_DEBUG] Duplicate job ID {jid}, skipping")
             continue
         seen_ids.add(jid)
 
         # Skip bare anchors (no metadata — often ads or stale links)
         if li.name == "a":
+            print("[PARSE_DEBUG] Bare anchor (likely ad), skipping")
             continue
 
-        title_el = li.select_one(".base-search-card__title, .job-card-list__title, .sr-only, .result-card__title, h3")
-        comp_el  = li.select_one(".base-search-card__subtitle, .job-card-container__company-name, .job-card-company-name, .result-card__subtitle, a[href*='/company/']")
-        loc_el   = li.select_one(".job-search-card__location, .result-card__meta .job-result-card__location, .job-card-container__metadata-item")
-        time_el  = li.select_one("time")  # LinkedIn usually uses <time datetime="...">
+        print(f"[PARSE_DEBUG] Processing job {jid}")
+        
+        # Enhanced element selection with more selectors
+        title_el = li.select_one("""
+            .base-search-card__title, 
+            .job-card-list__title, 
+            .sr-only, 
+            .result-card__title, 
+            h3, 
+            .job-card-container__link,
+            .job-card-list__title-link,
+            a[data-tracking-control-name="public_jobs_jserp-result_search-card"]
+        """)
+        
+        comp_el = li.select_one("""
+            .base-search-card__subtitle, 
+            .job-card-container__company-name, 
+            .job-card-company-name, 
+            .result-card__subtitle, 
+            a[href*='/company/'],
+            .job-card-container__primary-description,
+            .job-result-card__subtitle
+        """)
+        
+        loc_el = li.select_one("""
+            .job-search-card__location, 
+            .result-card__meta .job-result-card__location, 
+            .job-card-container__metadata-item,
+            .job-result-card__location,
+            .job-card-container__metadata-wrapper span
+        """)
+        
+        # Enhanced time element selection
+        time_el = li.select_one("""
+            time,
+            .job-search-card__listdate,
+            .job-result-card__listdate,
+            .job-card-container__metadata-item time,
+            .job-card-list__footer-wrapper time
+        """)
 
         title = (title_el.get_text(strip=True) if title_el else a.get_text(strip=True))
         company = comp_el.get_text(strip=True) if comp_el else ""
         location = loc_el.get_text(strip=True) if loc_el else ""
+        
+        print(f"[PARSE_DEBUG] Job {jid}: {title[:50]}... at {company}")
 
-        # Timestamp: prefer machine datetime, fallback to relative text
+        # Enhanced timestamp parsing with comprehensive fallback
         posted_at_iso: Optional[str] = None
+        timestamp_source = "none"
+        
+        # Try machine datetime first
         if time_el and time_el.has_attr("datetime"):
             try:
                 posted_dt = _parse_iso_ts(time_el["datetime"])
                 posted_at_iso = posted_dt.isoformat()
-            except Exception:
-                posted_at_iso = None
+                timestamp_source = f"datetime_attr: {time_el['datetime']}"
+                print(f"[PARSE_DEBUG] Job {jid}: Found datetime attribute: {time_el['datetime']}")
+            except Exception as e:
+                print(f"[PARSE_DEBUG] Job {jid}: Failed to parse datetime='{time_el.get('datetime')}': {e}")
 
+        # Fallback to relative text parsing
         if not posted_at_iso:
-            posted_txt = time_el.get_text(strip=True) if time_el else ""
-            parsed_dt = linkedin_relative_to_dt(posted_txt, ref_dt)
-            posted_at_iso = parsed_dt.isoformat() if parsed_dt else None
+            timestamp_candidates = []
+            
+            # From time element text
+            if time_el:
+                timestamp_candidates.append(time_el.get_text(strip=True))
+            
+            # Look for time info in various spans and metadata
+            for selector in [
+                "span:contains('ago')",
+                "span:contains('today')", 
+                "span:contains('yesterday')",
+                "span:contains('just now')",
+                ".job-card-container__metadata-item",
+                ".job-result-card__listdate"
+            ]:
+                elements = li.select(selector)
+                for el in elements:
+                    text = el.get_text(strip=True).lower()
+                    if any(keyword in text for keyword in ['ago', 'today', 'yesterday', 'just now', 'moment']):
+                        timestamp_candidates.append(el.get_text(strip=True))
+            
+            # Try parsing each candidate
+            for candidate in timestamp_candidates:
+                if candidate and candidate.strip():
+                    print(f"[PARSE_DEBUG] Job {jid}: Trying timestamp candidate: '{candidate}'")
+                    parsed_dt = linkedin_relative_to_dt(candidate, ref_dt)
+                    if parsed_dt:
+                        posted_at_iso = parsed_dt.isoformat()
+                        timestamp_source = f"relative_text: {candidate}"
+                        break
 
-        # If still unknown, skip the record
+        print(f"[PARSE_DEBUG] Job {jid}: Timestamp source = {timestamp_source}")
+        print(f"[PARSE_DEBUG] Job {jid}: Final timestamp = {posted_at_iso}")
+
+        # If still no timestamp, skip the job
         if not posted_at_iso:
+            print(f"[PARSE_DEBUG] Job {jid}: No timestamp found, SKIPPING")
             continue
 
         title, company, location = clean_title_company_location(title, company, location)
 
-        out.append({
+        job_data = {
             "job_id": jid,
             "title": title,
             "company": company or "-",
@@ -307,7 +440,12 @@ def parse_jobs_from_html(html: str, label: str, ref_dt: datetime) -> List[Dict[s
             "url": href.split("?")[0],
             "label": label,
             "posted_at": posted_at_iso
-        })
+        }
+        
+        out.append(job_data)
+        print(f"[PARSE_DEBUG] Job {jid}: Added to results")
+
+    print(f"[PARSE_DEBUG] Total jobs parsed: {len(out)}")
     return out
 
 def upsert_jobs(jobs: List[Dict[str, Any]]):
@@ -318,12 +456,14 @@ def upsert_jobs(jobs: List[Dict[str, Any]]):
         for j in jobs:
             c.execute("SELECT job_id FROM jobs WHERE job_id=?", (j["job_id"],))
             if c.fetchone():
+                print(f"[DB_DEBUG] Job {j['job_id']} already exists, skipping")
                 continue
             c.execute("""
                 INSERT INTO jobs(job_id, title, company, location, url, label, posted_at, first_seen_at, notified)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)
             """, (j["job_id"], j["title"], j["company"], j["location"], j["url"], j["label"], j["posted_at"], nowiso))
             inserted.append(j)
+            print(f"[DB_DEBUG] Job {j['job_id']} inserted as new")
         conn.commit()
     return inserted
 
@@ -377,6 +517,14 @@ async def run_once():
 
     with open(SEARCHES_PATH, "r") as f:
         searches = json.load(f)
+
+    current_time = now_ist()
+    cutoff_time = current_time - timedelta(hours=FRESH_HOURS)
+    
+    print(f"[FILTER_DEBUG] Current time: {current_time.isoformat()}")
+    print(f"[FILTER_DEBUG] Fresh hours: {FRESH_HOURS}")
+    print(f"[FILTER_DEBUG] Cutoff time: {cutoff_time.isoformat()}")
+    print(f"[FILTER_DEBUG] Jobs must be posted after: {cutoff_time.strftime('%Y-%m-%d %H:%M:%S %Z')}")
 
     print("[DEBUG] Loaded searches:", [(s.get("label"), s.get("url")) for s in searches])
     print(f"[DEBUG] Slack webhook configured: {bool(SLACK_WEBHOOK_URL)}")
@@ -439,6 +587,8 @@ async def run_once():
                 url = s["url"]
                 label = s["label"]
 
+                print(f"\n[SEARCH_DEBUG] Starting search {idx}/{len(searches)}: {label}")
+
                 try:
                     await page.goto(url, wait_until="domcontentloaded", timeout=60000)
                     await page.wait_for_timeout(int(random.uniform(*PAGE_LOAD_SETTLE_RANGE) * 1000))
@@ -465,23 +615,33 @@ async def run_once():
                         continue
 
                     html = await page.content()
-                    parsed = parse_jobs_from_html(html, label, now_ist())
+                    parsed = parse_jobs_from_html(html, label, current_time)
 
-                    # Strict freshness filtering BEFORE insert
-                    cutoff = now_ist() - timedelta(hours=FRESH_HOURS)
+                    # Strict freshness filtering BEFORE insert with detailed logging
                     filtered = []
                     dropped_invalid = 0
                     dropped_stale = 0
+                    
+                    print(f"\n[FILTER_DEBUG] Processing {len(parsed)} parsed jobs for {label}")
+                    
                     for j in parsed:
+                        job_id = j.get("job_id", "unknown")
+                        posted_at_str = j.get("posted_at", "")
+                        
                         try:
-                            dtp = _parse_iso_ts(j.get("posted_at", ""))
-                        except Exception:
+                            dtp = _parse_iso_ts(posted_at_str)
+                            age_hours = (current_time - dtp).total_seconds() / 3600
+                            
+                            if dtp >= cutoff_time:
+                                filtered.append(j)
+                                print(f"[FILTER_DEBUG] ✅ Job {job_id} INCLUDED: {age_hours:.1f}h old - {j['title'][:50]}...")
+                            else:
+                                dropped_stale += 1
+                                print(f"[FILTER_DEBUG] ❌ Job {job_id} TOO OLD: {age_hours:.1f}h old - {j['title'][:50]}...")
+                                
+                        except Exception as e:
                             dropped_invalid += 1
-                            continue
-                        if dtp >= cutoff:
-                            filtered.append(j)
-                        else:
-                            dropped_stale += 1
+                            print(f"[FILTER_DEBUG] ❌ Job {job_id} INVALID TIMESTAMP: {e} - {j['title'][:50]}...")
 
                     inserted = upsert_jobs(filtered)
 
@@ -489,9 +649,12 @@ async def run_once():
                     total_inserted += len(inserted)
                     new_jobs_all.extend(inserted)
 
-                    print(f"[summary] {label}: parsed={len(parsed)} filtered={len(filtered)} "
-                          f"dropped_invalid_ts={dropped_invalid} dropped_stale={dropped_stale} "
-                          f"inserted_new={len(inserted)}")
+                    print(f"\n[SUMMARY] {label}:")
+                    print(f"  - Parsed: {len(parsed)} jobs")
+                    print(f"  - After freshness filter: {len(filtered)} jobs")
+                    print(f"  - Invalid timestamps: {dropped_invalid}")
+                    print(f"  - Too old (>{FRESH_HOURS}h): {dropped_stale}")
+                    print(f"  - New jobs inserted: {len(inserted)}")
 
                     if idx < len(searches):
                         await page.wait_for_timeout(int(random.uniform(*INTER_SEARCH_SLEEP) * 1000))
@@ -512,18 +675,57 @@ async def run_once():
                 if 'browser' in locals() and browser:
                     await browser.close()
 
-    print(f"[summary] parsed_total={total_parsed} inserted_new_total={total_inserted} across {len(searches)} searches")
+    print(f"\n[FINAL_SUMMARY]")
+    print(f"Total jobs parsed: {total_parsed}")
+    print(f"Total new jobs inserted: {total_inserted}")
+    print(f"Searches processed: {len(searches)}")
 
-    if new_jobs_all and not is_quiet_hour(now_ist()):
-        heading = f"New LinkedIn jobs (≤{FRESH_HOURS}h) — {now_ist().strftime('%d %b %Y, %H:%M %Z')}"
-        print(f"[summary] sending to Slack: {len(new_jobs_all)} jobs")
+    if new_jobs_all and not is_quiet_hour(current_time):
+        heading = f"New LinkedIn jobs (≤{FRESH_HOURS}h) — {current_time.strftime('%d %b %Y, %H:%M %Z')}"
+        print(f"[SLACK_DEBUG] Sending {len(new_jobs_all)} jobs to Slack")
         await notify_slack(new_jobs_all, heading)
     else:
-        print("[summary] no new jobs to send this run (or quiet hour active).")
+        print("[SLACK_DEBUG] No new jobs to send this run (or quiet hour active)")
         # Heartbeat when zero results, so you still get a proof-of-life
         await send_heartbeat(len(new_jobs_all))
 
+def debug_timestamp_parsing():
+    """Test function to verify timestamp parsing works correctly"""
+    ref_dt = now_ist()
+    test_cases = [
+        "2 hours ago",
+        "1 day ago", 
+        "just now",
+        "3 weeks ago",
+        "today",
+        "yesterday", 
+        "5 minutes ago",
+        "1 month ago",
+        "30+ days ago",
+        "about 2 hours ago",
+        "over 1 week ago",
+        "2h ago",
+        "1d ago",
+        "3w ago",
+        "a day ago",
+        "an hour ago"
+    ]
+    
+    print("Testing timestamp parsing:")
+    print(f"Reference time: {ref_dt.isoformat()}")
+    print("-" * 60)
+    
+    for case in test_cases:
+        parsed = linkedin_relative_to_dt(case, ref_dt)
+        if parsed:
+            age_hours = (ref_dt - parsed).total_seconds() / 3600
+            print(f"'{case:15}' -> {parsed.isoformat()} ({age_hours:.1f}h ago)")
+        else:
+            print(f"'{case:15}' -> FAILED TO PARSE")
+
 async def main():
+    # Uncomment this line to test timestamp parsing before running
+    # debug_timestamp_parsing()
     await run_once()
 
 if __name__ == "__main__":
